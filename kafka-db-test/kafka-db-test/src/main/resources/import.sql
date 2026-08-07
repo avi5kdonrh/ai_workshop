@@ -1,0 +1,4 @@
+-- This file allow to write SQL commands that will be emitted in test and dev.
+-- delete from PERSON;
+-- truncate person;
+-- create sequence person_id_seq start with 1 increment by 1;

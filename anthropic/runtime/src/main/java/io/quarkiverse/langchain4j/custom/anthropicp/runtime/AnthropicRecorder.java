@@ -1,0 +1,406 @@
+package io.quarkiverse.langchain4j.custom.anthropicp.runtime;
+
+import static io.quarkiverse.langchain4j.runtime.OptionalUtil.firstOrDefault;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import jakarta.enterprise.inject.Any;
+import jakarta.enterprise.inject.Instance;
+import jakarta.enterprise.util.TypeLiteral;
+
+import org.jboss.logging.Logger;
+
+import dev.langchain4j.model.anthropic.AnthropicChatModel;
+import dev.langchain4j.model.anthropic.AnthropicServerTool;
+import dev.langchain4j.model.anthropic.AnthropicStreamingChatModel;
+import dev.langchain4j.model.chat.Capability;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.DisabledChatModel;
+import dev.langchain4j.model.chat.DisabledStreamingChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.chat.listener.ChatModelListener;
+import dev.langchain4j.model.chat.request.ResponseFormat;
+import io.quarkiverse.langchain4j.ModelBuilderCustomizer;
+import io.quarkiverse.langchain4j.custom.anthropicp.QuarkusAnthropicClient;
+import io.quarkiverse.langchain4j.custom.anthropicp.runtime.config.ChatModelConfig;
+import io.quarkiverse.langchain4j.custom.anthropicp.runtime.config.LangChain4jAnthropicConfig;
+import io.quarkiverse.langchain4j.custom.anthropicp.runtime.config.ToolSearchType;
+import io.quarkiverse.langchain4j.runtime.NamedConfigUtil;
+import io.quarkus.arc.SyntheticCreationalContext;
+import io.quarkus.runtime.RuntimeValue;
+import io.quarkus.runtime.annotations.Recorder;
+import io.smallrye.config.ConfigValidationException;
+
+@Recorder
+public class AnthropicRecorder {
+    private static final Logger LOG = Logger.getLogger(AnthropicRecorder.class);
+
+    private static final TypeLiteral<Instance<ChatModelListener>> CHAT_MODEL_LISTENER_TYPE_LITERAL = new TypeLiteral<>() {
+    };
+    private static final TypeLiteral<Instance<ModelBuilderCustomizer<AnthropicChatModel.AnthropicChatModelBuilder>>> CHAT_MODEL_CUSTOMIZER_TYPE_LITERAL = new TypeLiteral<>() {
+    };
+    private static final TypeLiteral<Instance<ModelBuilderCustomizer<AnthropicStreamingChatModel.AnthropicStreamingChatModelBuilder>>> STREAMING_CHAT_MODEL_CUSTOMIZER_TYPE_LITERAL = new TypeLiteral<>() {
+    };
+
+    private static final String DUMMY_KEY = "dummy";
+    public static final String ADVANCED_TOOL_USE = "advanced-tool-use-2025-11-20";
+    public static final String INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14";
+
+    private final RuntimeValue<LangChain4jAnthropicConfig> runtimeConfig;
+
+    public AnthropicRecorder(RuntimeValue<LangChain4jAnthropicConfig> runtimeConfig) {
+        this.runtimeConfig = runtimeConfig;
+    }
+
+    public Function<SyntheticCreationalContext<ChatModel>, ChatModel> chatModel(String configName) {
+        var anthropicConfig = correspondingAnthropicConfig(runtimeConfig.getValue(), configName);
+
+        if (anthropicConfig.enableIntegration()) {
+            var chatModelConfig = anthropicConfig.chatModel();
+            var apiKey = anthropicConfig.apiKey();
+
+            if (DUMMY_KEY.equals(apiKey)) {
+                throw new ConfigValidationException(createApiKeyConfigProblem(configName));
+            }
+
+            if (chatModelConfig.maxRetries() < 1) {
+                throw new ConfigValidationException(createMaxRetriesConfigProblem(configName));
+            }
+
+            Map<String, Object> customParams = new HashMap<>();
+            customParams.put("anthropic_version", anthropicConfig.version());
+
+            var builder = AnthropicChatModel.builder()
+                    .baseUrl(anthropicConfig.baseUrl())
+                    .apiKey(apiKey)
+                    .version(anthropicConfig.version())
+                    //.modelName(chatModelConfig.modelName())
+                    .logRequests(firstOrDefault(false, chatModelConfig.logRequests(), anthropicConfig.logRequests()))
+                    .logResponses(firstOrDefault(false, chatModelConfig.logResponses(), anthropicConfig.logResponses()))
+                    .timeout(anthropicConfig.timeout().orElse(Duration.ofSeconds(10)))
+                    .maxTokens(chatModelConfig.maxTokens())
+                    .customParameters(customParams)
+                    .maxRetries(chatModelConfig.maxRetries());
+
+            if (chatModelConfig.temperature().isPresent()) {
+                builder.temperature(chatModelConfig.temperature().getAsDouble());
+            }
+
+            builder.topK(chatModelConfig.topK().orElse(40));
+
+            if (chatModelConfig.topP().isPresent()) {
+                builder.topP(chatModelConfig.topP().getAsDouble());
+            }
+
+            if (chatModelConfig.stopSequences().isPresent()) {
+                builder.stopSequences(chatModelConfig.stopSequences().get());
+            }
+
+            if (chatModelConfig.responseFormat().isPresent()) {
+                ResponseFormat responseFormat = toResponseFormat(chatModelConfig.responseFormat().get());
+                builder.responseFormat(responseFormat);
+                if (responseFormat == ResponseFormat.JSON) {
+                    builder.supportedCapabilities(Capability.RESPONSE_FORMAT_JSON_SCHEMA);
+                }
+            }
+
+            ChatModelConfig.ThinkingConfig thinkingConfig = chatModelConfig.thinking();
+            if (thinkingConfig.type().isPresent()) {
+                if (chatModelConfig.topK().isPresent()) {
+                    LOG.warn("TopK was not configured because thinking was enabled");
+                }
+                builder.topK(null);
+                builder.thinkingType(thinkingConfig.type().get());
+            }
+
+            if (thinkingConfig.budgetTokens().isPresent()) {
+                builder.thinkingBudgetTokens(thinkingConfig.budgetTokens().get());
+            }
+
+            if (thinkingConfig.returnThinking().isPresent()) {
+                builder.returnThinking(thinkingConfig.returnThinking().get());
+            }
+
+            if (thinkingConfig.sendThinking().isPresent()) {
+                builder.sendThinking(thinkingConfig.sendThinking().get());
+            }
+
+            if (thinkingConfig.display().isPresent()) {
+                builder.thinkingDisplay(thinkingConfig.display().get());
+            }
+
+            // Pass caching configuration to builder
+            builder.cacheSystemMessages(chatModelConfig.cacheSystemMessages());
+            builder.cacheTools(chatModelConfig.cacheTools());
+
+            // Collect beta headers from features that need them
+            Set<String> betas = new LinkedHashSet<>();
+            if (thinkingConfig.interleaved().orElse(false)) {
+                betas.add(INTERLEAVED_THINKING);
+            }
+
+            Set<String> metadataKeys = new LinkedHashSet<>();
+            List<AnthropicServerTool> serverTools = new ArrayList<>();
+
+            // Configure tool search if enabled
+            ChatModelConfig.ToolSearchConfig toolSearchConfig = chatModelConfig.toolSearch();
+            if (Boolean.TRUE.equals(toolSearchConfig.enabled())) {
+                ToolSearchType type = ToolSearchType.from(toolSearchConfig.type());
+                serverTools.add(AnthropicServerTool.builder()
+                        .type(type.getToolType())
+                        .name(type.getToolName())
+                        .build());
+                metadataKeys.add("defer_loading");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            // Configure programmatic tool calling if enabled
+            ChatModelConfig.ProgrammaticToolCallingConfig ptcConfig = chatModelConfig.programmaticToolCalling();
+            if (Boolean.TRUE.equals(ptcConfig.enabled())) {
+                serverTools.add(AnthropicServerTool.builder()
+                        .type("code_execution_20250825")
+                        .name("code_execution")
+                        .build());
+                metadataKeys.add("allowed_callers");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            // Configure tool use examples if enabled
+            ChatModelConfig.ToolUseExamplesConfig toolUseExamplesConfig = chatModelConfig.toolUseExamples();
+            if (Boolean.TRUE.equals(toolUseExamplesConfig.enabled())) {
+                metadataKeys.add("input_examples");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            if (!betas.isEmpty()) {
+                builder.beta(String.join(",", betas));
+            }
+
+            if (!metadataKeys.isEmpty()) {
+                builder.toolMetadataKeysToSend(metadataKeys);
+            }
+
+            if (!serverTools.isEmpty()) {
+                builder.serverTools(serverTools);
+            }
+
+            var logCurl = firstOrDefault(false, anthropicConfig.logRequestsCurl());
+            var disableBeta = firstOrDefault(false, anthropicConfig.disableBetaHeader());
+
+            return new Function<>() {
+                @Override
+                public ChatModel apply(SyntheticCreationalContext<ChatModel> context) {
+                    builder.listeners(context.getInjectedReference(CHAT_MODEL_LISTENER_TYPE_LITERAL).stream()
+                            .collect(Collectors.toList()));
+                    QuarkusAnthropicClient.setLogCurlHint(logCurl);
+                    QuarkusAnthropicClient.setDisableBetaHint(disableBeta);
+                    ModelBuilderCustomizer.applyCustomizers(
+                            context.getInjectedReference(CHAT_MODEL_CUSTOMIZER_TYPE_LITERAL, Any.Literal.INSTANCE),
+                            builder, configName);
+                    return builder.build();
+                }
+            };
+        } else {
+            return new Function<>() {
+                @Override
+                public ChatModel apply(SyntheticCreationalContext<ChatModel> context) {
+                    return new DisabledChatModel();
+                }
+            };
+        }
+    }
+
+    public Function<SyntheticCreationalContext<StreamingChatModel>, StreamingChatModel> streamingChatModel(
+            String configName) {
+        var anthropicConfig = correspondingAnthropicConfig(runtimeConfig.getValue(), configName);
+
+        if (anthropicConfig.enableIntegration()) {
+            var chatModelConfig = anthropicConfig.chatModel();
+            var apiKey = anthropicConfig.apiKey();
+
+            if (DUMMY_KEY.equals(apiKey)) {
+                throw new ConfigValidationException(createApiKeyConfigProblem(configName));
+            }
+
+            Map<String, Object> customParams = new HashMap<>();
+            customParams.put("anthropic_version", anthropicConfig.version());
+
+            var builder = AnthropicStreamingChatModel.builder()
+                    .baseUrl(anthropicConfig.baseUrl())
+                    .apiKey(apiKey)
+                    .version(anthropicConfig.version())
+                    //.modelName(chatModelConfig.modelName())
+                    .logRequests(firstOrDefault(false, chatModelConfig.logRequests(), anthropicConfig.logRequests()))
+                    .logResponses(firstOrDefault(false, chatModelConfig.logResponses(), anthropicConfig.logResponses()))
+                    .timeout(anthropicConfig.timeout().orElse(Duration.ofSeconds(10)))
+                    .topK(chatModelConfig.topK().orElse(40))
+                    .customParameters(customParams)
+                    .maxTokens(chatModelConfig.maxTokens());
+
+            if (chatModelConfig.temperature().isPresent()) {
+                builder.temperature(chatModelConfig.temperature().getAsDouble());
+            }
+
+            if (chatModelConfig.topP().isPresent()) {
+                builder.topP(chatModelConfig.topP().getAsDouble());
+            }
+
+            if (chatModelConfig.stopSequences().isPresent()) {
+                builder.stopSequences(chatModelConfig.stopSequences().get());
+            }
+
+            if (chatModelConfig.responseFormat().isPresent()) {
+                ResponseFormat responseFormat = toResponseFormat(chatModelConfig.responseFormat().get());
+                builder.responseFormat(responseFormat);
+                if (responseFormat == ResponseFormat.JSON) {
+                    builder.supportedCapabilities(Capability.RESPONSE_FORMAT_JSON_SCHEMA);
+                }
+            }
+
+            ChatModelConfig.ThinkingConfig thinkingConfig = chatModelConfig.thinking();
+            if (thinkingConfig.type().isPresent()) {
+                if (chatModelConfig.topK().isPresent()) {
+                    LOG.warn("TopK was not configured because thinking was enabled");
+                }
+                builder.topK(null);
+                builder.thinkingType(thinkingConfig.type().get());
+            }
+
+            if (thinkingConfig.budgetTokens().isPresent()) {
+                builder.thinkingBudgetTokens(thinkingConfig.budgetTokens().get());
+            }
+
+            if (thinkingConfig.returnThinking().isPresent()) {
+                builder.returnThinking(thinkingConfig.returnThinking().get());
+            }
+
+            if (thinkingConfig.sendThinking().isPresent()) {
+                builder.sendThinking(thinkingConfig.sendThinking().get());
+            }
+
+            if (thinkingConfig.display().isPresent()) {
+                builder.thinkingDisplay(thinkingConfig.display().get());
+            }
+
+            // Pass caching configuration to builder
+            builder.cacheSystemMessages(chatModelConfig.cacheSystemMessages());
+            builder.cacheTools(chatModelConfig.cacheTools());
+
+            // Collect beta headers from features that need them
+            List<String> betas = new ArrayList<>();
+            if (thinkingConfig.interleaved().orElse(false)) {
+                betas.add(INTERLEAVED_THINKING);
+            }
+
+            Set<String> metadataKeys = new LinkedHashSet<>();
+            List<AnthropicServerTool> serverTools = new ArrayList<>();
+
+            // Configure tool search if enabled
+            ChatModelConfig.ToolSearchConfig toolSearchConfig = chatModelConfig.toolSearch();
+            if (Boolean.TRUE.equals(toolSearchConfig.enabled())) {
+                ToolSearchType type = ToolSearchType.from(toolSearchConfig.type());
+                serverTools.add(AnthropicServerTool.builder()
+                        .type(type.getToolType())
+                        .name(type.getToolName())
+                        .build());
+                metadataKeys.add("defer_loading");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            // Configure programmatic tool calling if enabled
+            ChatModelConfig.ProgrammaticToolCallingConfig ptcConfig = chatModelConfig.programmaticToolCalling();
+            if (Boolean.TRUE.equals(ptcConfig.enabled())) {
+                serverTools.add(AnthropicServerTool.builder()
+                        .type("code_execution_20250825")
+                        .name("code_execution")
+                        .build());
+                metadataKeys.add("allowed_callers");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            // Configure tool use examples if enabled
+            ChatModelConfig.ToolUseExamplesConfig toolUseExamplesConfig = chatModelConfig.toolUseExamples();
+            if (Boolean.TRUE.equals(toolUseExamplesConfig.enabled())) {
+                metadataKeys.add("input_examples");
+                betas.add(ADVANCED_TOOL_USE);
+            }
+
+            if (!betas.isEmpty()) {
+                builder.beta(String.join(",", betas));
+            }
+
+            if (!metadataKeys.isEmpty()) {
+                builder.toolMetadataKeysToSend(metadataKeys);
+            }
+
+            if (!serverTools.isEmpty()) {
+                builder.serverTools(serverTools);
+            }
+
+            var logCurl = firstOrDefault(false, anthropicConfig.logRequestsCurl());
+            var disableBeta = firstOrDefault(false, anthropicConfig.disableBetaHeader());
+
+            return new Function<>() {
+                @Override
+                public StreamingChatModel apply(SyntheticCreationalContext<StreamingChatModel> context) {
+                    builder.listeners(context.getInjectedReference(CHAT_MODEL_LISTENER_TYPE_LITERAL).stream()
+                            .collect(Collectors.toList()));
+                    QuarkusAnthropicClient.setLogCurlHint(logCurl);
+                    QuarkusAnthropicClient.setDisableBetaHint(disableBeta);
+                    ModelBuilderCustomizer.applyCustomizers(
+                            context.getInjectedReference(STREAMING_CHAT_MODEL_CUSTOMIZER_TYPE_LITERAL,
+                                    Any.Literal.INSTANCE),
+                            builder, configName);
+                    return builder.build();
+                }
+            };
+        } else {
+            return new Function<>() {
+                @Override
+                public StreamingChatModel apply(SyntheticCreationalContext<StreamingChatModel> context) {
+                    return new DisabledStreamingChatModel();
+                }
+            };
+        }
+    }
+
+    private LangChain4jAnthropicConfig.AnthropicConfig correspondingAnthropicConfig(
+            LangChain4jAnthropicConfig runtimeConfig, String configName) {
+
+        return NamedConfigUtil.isDefault(configName) ? runtimeConfig.defaultConfig()
+                : runtimeConfig.namedConfig().get(configName);
+    }
+
+    private static ConfigValidationException.Problem[] createApiKeyConfigProblem(String configName) {
+        return createConfigProblems("api-key", configName);
+    }
+
+    private static ConfigValidationException.Problem[] createMaxRetriesConfigProblem(String configName) {
+        return new ConfigValidationException.Problem[] { new ConfigValidationException.Problem(
+                "SRCFG00014: The config property quarkus.langchain4j.anthropic%schat-model.max-retries must be greater than zero"
+                        .formatted(NamedConfigUtil.isDefault(configName) ? "." : ("." + configName + "."))) };
+    }
+
+    private static ConfigValidationException.Problem[] createConfigProblems(String key, String configName) {
+        return new ConfigValidationException.Problem[] { createConfigProblem(key, configName) };
+    }
+
+    private static ConfigValidationException.Problem createConfigProblem(String key, String configName) {
+        return new ConfigValidationException.Problem(
+                "SRCFG00014: The config property quarkus.langchain4j.anthropic%s%s is required but it could not be found in any config source"
+                        .formatted(
+                                NamedConfigUtil.isDefault(configName) ? "." : ("." + configName + "."), key));
+    }
+
+    private static ResponseFormat toResponseFormat(String format) {
+        return switch (format.toLowerCase()) {
+            case "json" -> ResponseFormat.JSON;
+            case "text" -> ResponseFormat.TEXT;
+            default -> throw new IllegalArgumentException(
+                    String.format("Unknown response format: %s, must be one of: [json, text]", format));
+        };
+    }
+}
